@@ -1,0 +1,22 @@
+# Separate, disposable integration dependencies. Never points at production volumes.
+name: modeldock-test
+services:
+  postgres:
+    image: postgres:18@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db
+    environment:
+      POSTGRES_USER: modeldock
+      POSTGRES_PASSWORD: test-only-password
+      POSTGRES_DB: modeldock_test
+    ports: ['127.0.0.1:${MODELDock_TEST_PG_PORT:-55439}:5432']
+    tmpfs: [/var/lib/postgresql]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U modeldock -d modeldock_test]
+      interval: 2s
+      retries: 20
+  redis:
+    image: redis:7@sha256:3e1b24a1a8f24ff926b15e5ace8c38a03e5657fb66e1fc7e5188e315aa5fa094
+    ports: ['127.0.0.1:${MODELDock_TEST_REDIS_PORT:-56379}:6379']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      retries: 20

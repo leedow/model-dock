@@ -1,0 +1,93 @@
+name: ModelDock checks
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db
+        env:
+          POSTGRES_USER: modeldock
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: modeldock_test
+        ports: ['5432:5432']
+        options: --health-cmd='pg_isready -U modeldock -d modeldock_test' --health-interval=5s --health-retries=10
+      redis:
+        image: redis:7@sha256:3e1b24a1a8f24ff926b15e5ace8c38a03e5657fb66e1fc7e5188e315aa5fa094
+        ports: ['6379:6379']
+        options: --health-cmd='redis-cli ping' --health-interval=5s --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - uses: astral-sh/setup-uv@v6
+        with: {version: '0.9.11'}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check backend tests
+      - run: uv run ruff format --check backend tests
+      - run: uv run mypy backend/modeldock
+      - run: uv run pytest -q
+      - run: uv run alembic upgrade head && uv run alembic check
+        env:
+          MODELDock_DATABASE_URL: postgresql+asyncpg://modeldock:test-password@localhost:5432/modeldock_test
+      - run: uv run pytest -q
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://modeldock:test-password@localhost:5432/modeldock_test
+          TEST_REDIS_URL: redis://localhost:6379/15
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '20.19.1', cache: npm, cache-dependency-path: web/package-lock.json}
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint && npm test && npm run build && npm run format:check
+        working-directory: web
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - uses: astral-sh/setup-uv@v6
+        with: {version: '0.9.11'}
+      - uses: actions/setup-node@v4
+        with: {node-version: '20.19.1'}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: uv sync --frozen --extra dev
+      - run: npm ci && npm run build && npx playwright install --with-deps --no-shell chromium
+        working-directory: web
+      - run: npm run test:e2e
+        working-directory: web
+  container:
+    needs: [backend, frontend, browser]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure disposable credentials
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import secrets
+          text = Path('.env.example').read_text()
+          text = text.replace('MODELDock_ADMIN_PASSWORD=\n', 'MODELDock_ADMIN_PASSWORD=' + secrets.token_urlsafe(24) + '\n')
+          text = text.replace('POSTGRES_PASSWORD=modeldock', 'POSTGRES_PASSWORD=' + secrets.token_hex(16))
+          Path('.env').write_text(text)
+          Path('.env').chmod(0o600)
+          PY
+      - run: docker compose up --build -d
+      - name: Wait for full service readiness
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8000/health/ready; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --tail=100
+      - name: Cleanup disposable deployment
+        if: always()
+        run: docker compose down -v

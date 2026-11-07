@@ -1,0 +1,86 @@
+name: modeldock
+x-app: &app
+  image: modeldock:0.1.0
+  build:
+    context: .
+    args:
+      MODELDock_SPEECH: ${MODELDock_SPEECH:-false}
+  restart: unless-stopped
+  env_file: .env
+  environment: &app-environment
+    MODELDock_DATABASE_URL: postgresql+asyncpg://modeldock:${POSTGRES_PASSWORD:-modeldock}@postgres:5432/modeldock
+    MODELDock_REDIS_URL: redis://redis:6379/0
+    MODELDock_DATA_DIR: /data
+    MODELDock_PORT: 8000
+  volumes:
+    - files:/data
+  init: true
+services:
+  postgres:
+    image: postgres:18@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: modeldock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-modeldock}
+      POSTGRES_DB: modeldock
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U modeldock -d modeldock]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7@sha256:3e1b24a1a8f24ff926b15e5ace8c38a03e5657fb66e1fc7e5188e315aa5fa094
+    command: [redis-server, --appendonly, 'yes']
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *app
+    restart: 'no'
+    command: [sh, -c, 'alembic upgrade head && modeldock-init']
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  worker:
+    <<: *app
+    environment:
+      <<: *app-environment
+      MODELDock_MODELS_DIR: /models
+    volumes:
+      - files:/data
+      - models:/models
+    command: [modeldock-worker]
+    stop_grace_period: 30s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import os,redis; assert redis.Redis.from_url(os.environ['MODELDock_REDIS_URL']).get('modeldock:runtime:snapshot')"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 15s
+  api:
+    <<: *app
+    ports:
+      - '${MODELDock_BIND_HOST:-127.0.0.1}:${MODELDock_PORT:-8000}:8000'
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      worker: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+volumes:
+  postgres:
+  redis:
+  files:
+  models:
